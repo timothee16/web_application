@@ -27,7 +27,7 @@ def get_tables_with_subject_id(_conn):
             AND name NOT LIKE 'sqlite_%'
         """)
         tables = [table[0] for table in cursor.fetchall()]
-        
+
         
         tables_with_subject_id = []
         for table in tables:
@@ -341,6 +341,186 @@ def create_medication_timeline(data, start_date=None, end_date=None):
     
     return fig
     
+def create_single_medication_chart(data, medication_name, event_types=None, start_date=None, end_date=None):
+    """
+    Create a chart showing a single medication administration over time with filtering by event type
+    and visualization as horizontal lines between scheduletime and storetime
+    """
+    if data.empty or medication_name not in data['medication'].unique():
+        return None
+    
+    # Filter data for the selected medication
+    med_data = data[data['medication'] == medication_name].copy()
+    
+    # Filter by event type if specified
+    if event_types and 'event_txt' in med_data.columns:
+        med_data = med_data[med_data['event_txt'].isin(event_types)]
+        
+    if med_data.empty:
+        return None
+    
+    # Convert datetime columns if not already
+    for col in ['charttime', 'scheduletime', 'storetime']:
+        if col in med_data.columns:
+            med_data[col] = pd.to_datetime(med_data[col], errors='coerce')
+    
+    # For records without storetime, use charttime as an approximation
+    if 'storetime' in med_data.columns and 'charttime' in med_data.columns:
+        med_data['storetime'] = med_data['storetime'].fillna(med_data['charttime'])
+    
+    # For records without scheduletime, use charttime as an approximation
+    if 'scheduletime' in med_data.columns and 'charttime' in med_data.columns:
+        med_data['scheduletime'] = med_data['scheduletime'].fillna(med_data['charttime'])
+    
+    # If we don't have both scheduletime and storetime, create a default duration
+    if 'scheduletime' not in med_data.columns or 'storetime' not in med_data.columns:
+        return None
+    
+    # Set date range for the chart
+    min_date = start_date if start_date else med_data['scheduletime'].min()
+    max_date = end_date if end_date else med_data['storetime'].max()
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Sort by scheduletime to process overlaps
+    med_data = med_data.sort_values('scheduletime')
+    
+    # Set up colors for different event types
+    event_colors = {
+        'Administered': 'rgb(0, 128, 0)',      # Green
+        'Flushed': 'rgb(0, 0, 255)',           # Blue
+        'Not Given': 'rgb(255, 0, 0)',         # Red
+        'Not Given per Sliding Scale': 'rgb(255, 165, 0)'  # Orange
+    }
+    
+    # Default color for events not in the predefined mapping
+    default_color = 'rgb(128, 128, 128)'  # Gray
+    
+    # Process each medication administration and handle overlaps
+    row_positions = {}  # Track vertical positions for each row
+    
+    for idx, row in med_data.iterrows():
+        start_time = row['scheduletime']
+        end_time = row['storetime']
+        
+        if pd.isnull(start_time) or pd.isnull(end_time):
+            continue
+            
+        # Make sure end time is after start time
+        if end_time < start_time:
+            end_time = start_time
+            
+        # Determine vertical position (row) for this administration
+        row_level = 0
+        while True:
+            overlap = False
+            if row_level in row_positions:
+                for pos_start, pos_end in row_positions[row_level]:
+                    if max(start_time, pos_start) <= min(end_time, pos_end):
+                        overlap = True
+                        break
+            if not overlap:
+                break
+            row_level += 1
+        
+        # Store position
+        if row_level not in row_positions:
+            row_positions[row_level] = []
+        row_positions[row_level].append((start_time, end_time))
+        
+        # Get event type and corresponding color
+        event_txt = row.get('event_txt', 'Unknown')
+        color = event_colors.get(event_txt, default_color)
+        
+        # Add horizontal line for the administration duration
+        fig.add_shape(
+            type="line",
+            x0=start_time,
+            y0=row_level + 1,  # Position at row level (add 1 to start from 1 instead of 0)
+            x1=end_time,
+            y1=row_level + 1,
+            line=dict(
+                color=color,
+                width=4,
+            )
+        )
+        
+        # Add marker at start for better visibility
+        fig.add_trace(go.Scatter(
+            x=[start_time],
+            y=[row_level + 1],
+            mode='markers',
+            marker=dict(
+                color=color,
+                size=8,
+                symbol='circle',
+            ),
+            showlegend=False,
+            hoverinfo='text',
+            hovertext=f"Start: {start_time.strftime('%Y-%m-%d %H:%M')}<br>Event: {event_txt}"
+        ))
+        
+        # Build hover information text
+        dose_info = f"Dose: {row['dose_given']} {row['dose_unit']}" if 'dose_given' in row and pd.notna(row['dose_given']) else ""
+        route_info = f"Route: {row['route']}" if 'route' in row and pd.notna(row['route']) else ""
+        hover_text = f"{medication_name}<br>Event: {event_txt}<br>Schedule: {start_time.strftime('%Y-%m-%d %H:%M')}<br>End: {end_time.strftime('%Y-%m-%d %H:%M')}"
+        if dose_info:
+            hover_text += f"<br>{dose_info}"
+        if route_info:
+            hover_text += f"<br>{route_info}"
+            
+        # Add invisible trace for hover information
+        fig.add_trace(go.Scatter(
+            x=[(start_time + end_time)/2],  # Middle of line
+            y=[row_level + 1],
+            mode='markers',
+            marker=dict(
+                color='rgba(0,0,0,0)',  # Invisible
+                size=1,
+            ),
+            showlegend=False,
+            hoverinfo='text',
+            hovertext=hover_text
+        ))
+    
+    # Create legend for event types
+    for event, color in event_colors.items():
+        if event in med_data.get('event_txt', []):
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],  # No data points
+                mode='lines',
+                line=dict(color=color, width=4),
+                name=event
+            ))
+    
+    # Update layout
+    max_rows = max(row_positions.keys()) + 2 if row_positions else 2
+    
+    fig.update_layout(
+        title=f"{medication_name} Administration Timeline",
+        xaxis_title="Date/Time",
+        yaxis=dict(
+            title="Administrations",
+            range=[0, max_rows],
+            tickvals=list(range(1, max_rows)),
+            ticktext=[f"Admin {i+1}" for i in range(max_rows-1)],
+        ),
+        height=max(300, 50 + 40 * max_rows),  # Adjust height based on number of rows
+        margin=dict(l=40, r=40, t=80, b=40),
+        xaxis_range=[min_date, max_date],
+        plot_bgcolor='rgba(248,249,250,0.5)',
+        title_font=dict(size=18),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+    )
+    
+    return fig
 
 def create_combined_medication_vital_chart(med_data, vital_data, medication_name, vital_sign_name, start_date=None, end_date=None):
     """chart combining medication administration and vital sign"""
@@ -474,49 +654,135 @@ def display_medication_dashboard(medication_data, vital_signs_data, admit_time, 
     if med_timeline:
         st.plotly_chart(med_timeline, use_container_width=True)
     
-    if not vital_signs_data.empty and not medication_data.empty:
-        st.markdown("### Medication-Vital Sign Analysis")
-        
-        available_meds = medication_data['medication'].unique().tolist()
-        
-        if not available_meds:
-            st.warning("No medications available for analysis.")
-        else:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                top_meds = medication_data['medication'].value_counts().nlargest(5).index.tolist()
-                if top_meds:
-                    selected_med = st.selectbox("Select Medication:", top_meds, key="med_dash_med_select")
-                else:
-                    st.warning("No medications found in the data.")
-                    selected_med = None
-            
-            with col2:
-                available_vitals = vital_signs_data['label'].unique().tolist()
-                if available_vitals:
-                    selected_vital = st.selectbox("Select Vital Sign:", available_vitals, key="med_dash_vital_select")
-                else:
-                    st.warning("No vital signs found in the data.")
-                    selected_vital = None
-            
-            if selected_med and selected_vital:
-                combined_chart = create_combined_medication_vital_chart(
-                    medication_data,
-                    vital_signs_data,
-                    selected_med,
-                    selected_vital,
-                    admit_time,
-                    discharge_time
-                )
-                
-                if combined_chart:
-                    st.plotly_chart(combined_chart, use_container_width=True)
-                    st.info("This chart shows the relationship between medication administration (red triangles/vertical lines) and the selected vital sign.")
-                else:
-                    st.warning("Insufficient data to create the combined viz.")
+    # Nouvelle section pour afficher un seul médicament à la fois avec plus de filtres
+    st.markdown("### Single Medication Administration Timeline")
+    available_meds = medication_data['medication'].unique().tolist()
     
-    st.markdown('</div>', unsafe_allow_html=True)
+    if available_meds:
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            selected_med = st.selectbox("Select medication to display:", 
+                                        options=available_meds,
+                                        key="single_med_select")
+        
+        # Filtrage par type d'événement si la colonne existe
+        selected_events = None
+        with col2:
+            if 'event_txt' in medication_data.columns:
+                event_options = medication_data['event_txt'].dropna().unique().tolist()
+                if event_options:
+                    selected_events = st.multiselect(
+                        "Filter by event type:",
+                        options=event_options,
+                        default=event_options,
+                        key="event_type_filter"
+                    )
+        
+        if selected_med:
+            # Date range for filtering
+            date_col1, date_col2 = st.columns([1, 1])
+            with date_col1:
+                if admit_time and discharge_time:
+                    start_date = st.date_input(
+                        "Start date:",
+                        value=admit_time.to_pydatetime(),
+                        min_value=admit_time.to_pydatetime(),
+                        max_value=discharge_time.to_pydatetime(),
+                        key="med_start_date"
+                    )
+            with date_col2:
+                if admit_time and discharge_time:
+                    end_date = st.date_input(
+                        "End date:",
+                        value=discharge_time.to_pydatetime(),
+                        min_value=admit_time.to_pydatetime(),
+                        max_value=discharge_time.to_pydatetime(),
+                        key="med_end_date"
+                    )
+            
+            # Convert date inputs to datetime
+            start_datetime = pd.to_datetime(start_date) if 'start_date' in locals() else admit_time
+            end_datetime = pd.to_datetime(end_date) if 'end_date' in locals() else discharge_time
+            
+            # Add a time selector to specify hours if needed
+            show_time_selector = st.checkbox("Specify time range", value=False, key="time_selector_checkbox")
+            if show_time_selector:
+                time_col1, time_col2 = st.columns([1, 1])
+                with time_col1:
+                    start_time = st.time_input("Start time:", value=pd.to_datetime('00:00').time(), key="start_time")
+                    start_datetime = pd.to_datetime(f"{start_date} {start_time}")
+                with time_col2:
+                    end_time = st.time_input("End time:", value=pd.to_datetime('23:59').time(), key="end_time")
+                    end_datetime = pd.to_datetime(f"{end_date} {end_time}")
+            
+            single_med_chart = create_single_medication_chart(
+                medication_data,
+                selected_med,
+                event_types=selected_events,
+                start_date=start_datetime,
+                end_date=end_datetime
+            )
+            
+            if single_med_chart:
+                st.plotly_chart(single_med_chart, use_container_width=True)
+                
+                # Ajouter des explications
+                st.info("""
+                **Graphique d'administration de médicament:**
+                - Chaque ligne horizontale représente une administration du médicament
+                - Les lignes sont empilées verticalement lorsqu'elles se chevauchent dans le temps
+                - Les couleurs indiquent le type d'événement (Administered, Not Given, etc.)
+                - Passez votre souris sur les lignes pour voir les détails
+                """)
+            else:
+                st.warning(f"No administration data available for {selected_med} with the selected filters")
+    else:
+        st.warning("No medications available for display")
+    
+    # Afficher l'historique d'administration des médicaments
+    st.markdown("### Medication Administration History")
+    
+    if 'medication' in medication_data.columns and 'charttime' in medication_data.columns:
+        # Colonnes à afficher
+        display_cols = ['charttime', 'medication']
+        for col in ['dose_given', 'dose_unit', 'route', 'scheduletime', 'storetime', 'event_txt']:
+            if col in medication_data.columns:
+                display_cols.append(col)
+        
+        # Créer le dataframe pour l'affichage
+        med_history = medication_data[display_cols].sort_values('charttime', ascending=False)
+        
+        # Renommer les colonnes pour un affichage plus clair
+        column_mapping = {
+            'charttime': 'Administration Time',
+            'medication': 'Medication',
+            'dose_given': 'Dose',
+            'dose_unit': 'Unit',
+            'route': 'Route',
+            'scheduletime': 'Scheduled Time',
+            'storetime': 'Store Time',
+            'event_txt': 'Event Type'
+        }
+        
+        med_history = med_history.rename(columns={col: column_mapping.get(col, col) for col in med_history.columns})
+        
+        # Filtrer par médicament spécifique si demandé
+        med_filter = st.checkbox("Filter history by medication", value=False, key="med_history_filter")
+        if med_filter:
+            selected_med_history = st.selectbox(
+                "Select medication:",
+                options=available_meds,
+                key="med_history_selection"
+            )
+            if selected_med_history:
+                med_history = med_history[med_history['Medication'] == selected_med_history]
+
+        # Afficher le dataframe filtré
+        st.dataframe(med_history, use_container_width=True, hide_index=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+                
 
 def display_patient_summary(conn, subject_id, hadm_id):
     """display summary of patient information"""
@@ -752,11 +1018,11 @@ def display_time_series_data(time_series_data, admit_time, discharge_time):
 
 
 def display_detailed_data(patient_data, tables):
-    """Affiche les données détaillées pour un patient sous forme de texte clair et organisé"""
+    """Affiche les données détaillées pour un patient avec filtrage"""
     st.markdown('<div class="data-card">', unsafe_allow_html=True)
     st.subheader("Detailed Patient Information")
 
-    # regroupe les tables par catégorie
+    # Regroupe les tables par catégorie
     table_categories = {
         "Medical Results": ["labevents", "microbiologyevents", "chartevents", "datetimeevents"],
         "Medications": ["emar", "emar_detail", "pharmacy", "prescriptions", "ingredientevents"],
@@ -766,12 +1032,12 @@ def display_detailed_data(patient_data, tables):
         "Others": []
     }
 
-    # classe les tables restantes
+    # Classe les tables restantes
     for table in tables:
         if table not in sum(table_categories.values(), []):
             table_categories["Others"].append(table)
 
-    # créer des onglets par catégorie
+    # Créer des onglets par catégorie
     categories = [cat for cat, tbls in table_categories.items() if any(t in patient_data for t in tbls)]
     if not categories:
         st.info("No detailed data available for this patient")
@@ -794,35 +1060,202 @@ def display_detailed_data(patient_data, tables):
                                 pass
 
                     st.markdown(f"### {table.replace('_', ' ').title()}")
-                    for idx, row in df.iterrows():
-                        with st.expander(f"Record {idx + 1}", expanded=False):
-                            for col, value in row.dropna().items():  # Supprime les valeurs vides
-                                st.markdown(f"**{col.replace('_', ' ').title()}**: {value}")
+                    
+                    # Ajout d'un filtre de recherche par texte
+                    search_term = st.text_input(f"Filter records in {table.title()} (type to search in any field):", key=f"filter_{table}")
+                    
+                    # Ajout d'un filtre par colonne
+                    if len(df.columns) > 0:
+                        filter_col = st.selectbox(f"Filter by column:", ["None"] + list(df.columns), key=f"filter_col_{table}")
+                        
+                        if filter_col != "None":
+                            unique_values = df[filter_col].dropna().unique()
+                            if len(unique_values) <= 30:  # N'affiche le sélecteur que si le nombre de valeurs est raisonnable
+                                filter_value = st.multiselect(f"Select values for {filter_col}:", 
+                                                             options=unique_values, 
+                                                             key=f"filter_val_{table}")
+                                if filter_value:
+                                    df = df[df[filter_col].isin(filter_value)]
+                    
+                    # Application du filtre de recherche textuelle
+                    if search_term:
+                        mask = pd.Series(False, index=df.index)
+                        for col in df.columns:
+                            mask |= df[col].astype(str).str.contains(search_term, case=False, na=False)
+                        df = df[mask]
+                    
+                    # Affichage des résultats filtrés
+                    if not df.empty:
+                        st.write(f"Showing {len(df)} record(s)")
+                        
+                        # Limiter le nombre d'enregistrements affichés si trop nombreux
+                        max_records_to_display = 30
+                        if len(df) > max_records_to_display:
+                            st.warning(f"Displaying first {max_records_to_display} records. Use filters to narrow down results.")
+                            df = df.head(max_records_to_display)
+                        
+                        for idx, row in df.iterrows():
+                            with st.expander(f"Record {idx + 1}", expanded=False):
+                                for col, value in row.dropna().items():  # Supprime les valeurs vides
+                                    st.markdown(f"**{col.replace('_', ' ').title()}**: {value}")
+                    else:
+                        st.info("No records match the filter criteria.")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
+def create_single_medication_timeline(med_data):
+    """Crée un graphique de prise d'un seul médicament au cours du temps avec filtres"""
+    if med_data.empty:
+        st.info("No medication data available")
+        return
+    
+    # Vérifier que les colonnes nécessaires existent
+    required_columns = ["medication", "scheduletime", "storetime", "event_txt"]
+    missing_columns = [col for col in required_columns if col not in med_data.columns]
+    
+    # Si certaines colonnes sont manquantes, utiliser des alternatives ou dégrader gracieusement
+    if "event_txt" not in med_data.columns:
+        med_data["event_txt"] = "Unknown"
+    
+    if "scheduletime" not in med_data.columns and "charttime" in med_data.columns:
+        med_data["scheduletime"] = med_data["charttime"]
+    
+    if "storetime" not in med_data.columns and "scheduletime" in med_data.columns:
+        # Si storetime est manquant, estimer à scheduletime + 1 heure par défaut
+        med_data["storetime"] = pd.to_datetime(med_data["scheduletime"]) + pd.Timedelta(hours=1)
+    
+    # Convertir les dates en datetime
+    for date_col in ["scheduletime", "storetime"]:
+        if date_col in med_data.columns:
+            med_data[date_col] = pd.to_datetime(med_data[date_col])
+    
+    # Créer les filtres
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Liste des médicaments disponibles
+        medications = sorted(med_data["medication"].unique().tolist())
+        selected_medication = st.selectbox("Select Medication:", medications, key="single_med_timeline")
+    
+    with col2:
+        # Si event_txt existe, créer un filtre pour cela aussi
+        if "event_txt" in med_data.columns:
+            event_types = sorted(med_data["event_txt"].unique().tolist())
+            selected_events = st.multiselect(
+                "Filter by Event Status:", 
+                event_types,
+                default=event_types,
+                key="single_med_event_filter"
+            )
+        else:
+            selected_events = None
+    
+    # Filtrer les données
+    filtered_data = med_data[med_data["medication"] == selected_medication]
+    
+    if selected_events:
+        filtered_data = filtered_data[filtered_data["event_txt"].isin(selected_events)]
+    
+    if filtered_data.empty:
+        st.warning("No data available for the selected filters")
+        return
+    
+    # Créer le graphique de prise de médicament
+    create_medication_administration_chart(filtered_data)
+
+def create_medication_administration_chart(med_data):
+    """Crée un graphique montrant la prise de médicament avec des lignes parallèles à l'axe des x"""
+    if med_data.empty or "scheduletime" not in med_data.columns or "storetime" not in med_data.columns:
+        st.warning("Insufficient data to create medication administration chart")
+        return
+    
+    # Trier par date de planification
+    med_data = med_data.sort_values("scheduletime")
+    
+    # Créer une figure Plotly
+    fig = go.Figure()
+    
+    # Définir une hauteur par défaut pour chaque ligne
+    line_height = 1
+    
+    # Grouper les administrations qui se chevauchent
+    scheduled_meds = []
+    
+    for i, row in med_data.iterrows():
+        # Par défaut, une nouvelle administration commence à la hauteur 0
+        current_height = 0
+        
+        # Vérifier s'il y a chevauchement avec des administrations existantes
+        for existing_med in scheduled_meds:
+            if (row["scheduletime"] <= existing_med["end_time"] and 
+                row["storetime"] >= existing_med["start_time"]):
+                # Il y a chevauchement, augmenter la hauteur
+                if current_height <= existing_med["height"]:
+                    current_height = existing_med["height"] + line_height
+        
+        # Ajouter cette administration à la liste
+        scheduled_meds.append({
+            "start_time": row["scheduletime"],
+            "end_time": row["storetime"],
+            "height": current_height,
+            "event_txt": row.get("event_txt", "Unknown"),
+            "dose": f"{row.get('dose_given', '')} {row.get('dose_unit', '')}".strip()
+        })
+    
+    # Créer un code couleur pour les différents types d'événements
+    event_types = med_data["event_txt"].unique() if "event_txt" in med_data.columns else ["Unknown"]
+    colors = px.colors.qualitative.Plotly[:len(event_types)]
+    color_map = dict(zip(event_types, colors))
+    
+    # Ajouter les lignes au graphique
+    for med in scheduled_meds:
+        event_txt = med["event_txt"]
+        color = color_map.get(event_txt, "blue")
+        
+        # Ajouter la ligne pour cette administration
+        fig.add_trace(go.Scatter(
+            x=[med["start_time"], med["end_time"]],
+            y=[med["height"], med["height"]],
+            mode="lines",
+            line=dict(color=color, width=3),
+            name=event_txt,
+            hoverinfo="text",
+            text=[f"Start: {med['start_time']}<br>Status: {event_txt}<br>Dose: {med['dose']}",
+                  f"End: {med['end_time']}<br>Status: {event_txt}<br>Dose: {med['dose']}"],
+            showlegend=True
+        ))
+    
+    # Configuration de la mise en page
+    medication_name = med_data["medication"].iloc[0]
+    
+    fig.update_layout(
+        title=f"Administration Timeline for {medication_name}",
+        xaxis_title="Time",
+        yaxis_title="Administration Instances",
+        height=500,
+        margin=dict(l=40, r=40, t=80, b=40),
+        hovermode="closest",
+        plot_bgcolor='rgba(248,249,250,0.5)',
+        yaxis=dict(
+            showticklabels=False,  # Masquer les étiquettes de l'axe y
+            showgrid=False,        # Masquer la grille de l'axe y
+        ),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Ajouter une explication
+    st.info("This chart shows medication administration periods. Each horizontal line represents a single administration. Higher lines indicate overlapping administrations.")
+
 def display_smart_patient_view(patient_data, tables):
-    """Affiche les données patient de manière intelligente et contextuelle"""
+    """Affiche uniquement les données de médicaments de manière intelligente"""
     st.markdown('<div class="data-card">', unsafe_allow_html=True)
     st.subheader("Smart Patient View")
     
-    # organisation par types d'informations cliniques
+    # On ne garde que les médicaments
     clinical_data = {}
-    
-    # extraire les informations significatives par contexte
-    if "labevents" in patient_data and not patient_data["labevents"].empty:
-        lab_df = patient_data["labevents"]
-        if "label" in lab_df.columns and "valuenum" in lab_df.columns and "charttime" in lab_df.columns:
-            clinical_data["labs"] = lab_df[["charttime", "label", "valuenum", "valueuom"]].copy()
-            clinical_data["labs"]["charttime"] = pd.to_datetime(clinical_data["labs"]["charttime"])
-            clinical_data["labs"] = clinical_data["labs"].sort_values("charttime", ascending=False)
-    
-    if "chartevents" in patient_data and not patient_data["chartevents"].empty:
-        chart_df = patient_data["chartevents"]
-        if "label" in chart_df.columns and "valuenum" in chart_df.columns and "charttime" in chart_df.columns:
-            clinical_data["vitals"] = chart_df[["charttime", "label", "valuenum", "valueuom"]].copy()
-            clinical_data["vitals"]["charttime"] = pd.to_datetime(clinical_data["vitals"]["charttime"])
-            clinical_data["vitals"] = clinical_data["vitals"].sort_values("charttime", ascending=False)
     
     if "emar" in patient_data and not patient_data["emar"].empty:
         med_df = patient_data["emar"]
@@ -833,180 +1266,75 @@ def display_smart_patient_view(patient_data, tables):
                 clinical_data["medications"]["charttime"] = pd.to_datetime(clinical_data["medications"]["charttime"])
                 clinical_data["medications"] = clinical_data["medications"].sort_values("charttime", ascending=False)
     
-    if "procedures_icd" in patient_data and not patient_data["procedures_icd"].empty:
-        proc_df = patient_data["procedures_icd"]
-        relevant_cols = [col for col in proc_df.columns if col not in ["subject_id", "hadm_id"]]
-        if relevant_cols:
-            clinical_data["procedures"] = proc_df[relevant_cols].copy()
-    
-    if "diagnoses_icd" in patient_data and not patient_data["diagnoses_icd"].empty:
-        diag_df = patient_data["diagnoses_icd"]
-        relevant_cols = [col for col in diag_df.columns if col not in ["subject_id", "hadm_id"]]
-        if relevant_cols:
-            clinical_data["diagnoses"] = diag_df[relevant_cols].copy()
-    
-    # si aucune donnée n'est trouvée, afficher un message et retourner
-    if not clinical_data:
-        st.info("No structured clinical data found to display in the smart view")
+    # Si aucune donnée n'est trouvée, afficher un message et retourner
+    if not clinical_data or "medications" not in clinical_data:
+        st.info("No medication data found to display in the smart view")
         st.markdown('</div>', unsafe_allow_html=True)
         return
     
-    # créer des onglets pour les différentes catégories de données
-    clinical_categories = list(clinical_data.keys())
-    cat_tabs = st.tabs([cat.title() for cat in clinical_categories])
+    # Afficher uniquement les médicaments
+    df = clinical_data["medications"]
     
-    # afficher les données dans chaque onglet
-    for i, category in enumerate(clinical_categories):
-        with cat_tabs[i]:
-            df = clinical_data[category]
+    # Regrouper par médicament
+    if "medication" in df.columns:
+        med_count = df["medication"].value_counts().reset_index()
+        med_count.columns = ["Medication", "Count"]
+        
+        st.markdown("#### Current Medications")
+        
+        if "dose_given" in df.columns and "dose_unit" in df.columns and "route" in df.columns:
+            # Créer un résumé des médicaments actuels
+            current_meds = df.sort_values("charttime", ascending=False).drop_duplicates("medication")
+            med_summary = pd.DataFrame({
+                "Medication": current_meds["medication"],
+                "Dose": current_meds.apply(lambda x: f"{x['dose_given']} {x['dose_unit']}" if pd.notna(x['dose_given']) else "N/A", axis=1),
+                "Route": current_meds["route"],
+                "Last Given": current_meds["charttime"].dt.strftime('%Y-%m-%d %H:%M')
+            })
             
-            if category in ["labs", "vitals"]:
-                # Grouper par type de mesure (label)
-                unique_labels = df["label"].unique().tolist()
-                
-                # Option de filtrage
-                selected_labels = st.multiselect(
-                    "Filter measurements:", 
-                    unique_labels,
-                    default=unique_labels[:min(5, len(unique_labels))],
-                    key=f"filter_{category}"
-                )
-                
-                if not selected_labels:
-                    st.warning("Please select at least one measurement to display")
-                    continue
-                    
-                filtered_df = df[df["label"].isin(selected_labels)]
-                
-                # Afficher les dernières valeurs pour chaque mesure
-                st.markdown("#### Latest Measurements")
-                latest_values = filtered_df.sort_values("charttime", ascending=False).drop_duplicates("label")
-                
-                # Créer une disposition en colonnes pour les dernières valeurs
-                cols = st.columns(min(3, len(latest_values)))
-                for j, (_, row) in enumerate(latest_values.iterrows()):
-                    col_idx = j % len(cols)
-                    with cols[col_idx]:
-                        unit = f" {row['valueuom']}" if pd.notna(row["valueuom"]) else ""
-                        value = f"{row['valuenum']}{unit}" if pd.notna(row["valuenum"]) else "N/A"
-                        st.metric(
-                            label=row["label"], 
-                            value=value,
-                            delta_color="off",
-                            help=f"Measured on {row['charttime'].strftime('%Y-%m-%d %H:%M')}"
-                        )
-                
-                # Afficher l'historique sous forme de tableau
-                st.markdown("#### Measurement History")
-                history_df = filtered_df[["charttime", "label", "valuenum", "valueuom"]].sort_values("charttime", ascending=False)
-                history_df.columns = ["Date/Time", "Measurement", "Value", "Unit"]
-                
-                st.dataframe(
-                    history_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Date/Time": st.column_config.DatetimeColumn("Date/Time", format="DD/MM/YYYY HH:mm"),
-                        "Measurement": st.column_config.TextColumn("Measurement"),
-                        "Value": st.column_config.NumberColumn("Value"),
-                        "Unit": st.column_config.TextColumn("Unit")
-                    }
-                )
-                
-            elif category == "medications":
-                # Regrouper par médicament
-                if "medication" in df.columns:
-                    med_count = df["medication"].value_counts().reset_index()
-                    med_count.columns = ["Medication", "Count"]
-                    
-                    st.markdown("#### Current Medications")
-                    
-                    if "dose_given" in df.columns and "dose_unit" in df.columns and "route" in df.columns:
-                        # Créer un résumé des médicaments actuels
-                        current_meds = df.sort_values("charttime", ascending=False).drop_duplicates("medication")
-                        med_summary = pd.DataFrame({
-                            "Medication": current_meds["medication"],
-                            "Dose": current_meds.apply(lambda x: f"{x['dose_given']} {x['dose_unit']}" if pd.notna(x['dose_given']) else "N/A", axis=1),
-                            "Route": current_meds["route"],
-                            "Last Given": current_meds["charttime"].dt.strftime('%Y-%m-%d %H:%M')
-                        })
-                        
-                        st.dataframe(
-                            med_summary,
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                    else:
-                        # Afficher un simple comptage si les colonnes détaillées ne sont pas disponibles
-                        st.bar_chart(med_count.set_index("Medication"))
-                    
-                    # Historique des administrations médicamenteuses
-                    st.markdown("#### Medication Administration History")
-                    med_history = df.sort_values("charttime", ascending=False)
-                    
-                    # Sélectionner les colonnes pertinentes pour l'affichage
-                    display_cols = ["charttime", "medication"]
-                    for col in ["dose_given", "dose_unit", "route", "scheduletime"]:
-                        if col in med_history.columns:
-                            display_cols.append(col)
-                    
-                    # Renommer les colonnes pour un affichage plus clair
-                    col_names = {
-                        "charttime": "Given Time",
-                        "medication": "Medication",
-                        "dose_given": "Dose",
-                        "dose_unit": "Unit",
-                        "route": "Route",
-                        "scheduletime": "Scheduled Time"
-                    }
-                    
-                    display_df = med_history[display_cols].rename(columns={col: col_names.get(col, col) for col in display_cols})
-                    
-                    st.dataframe(
-                        display_df,
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.info("Medication data structure is not in the expected format")
-            
-            elif category in ["diagnoses", "procedures"]:
-                # Pour les diagnostics et procédures, créer un affichage simple
-                # On attend généralement des codes ICD avec descriptions
-                relevant_cols = df.columns.tolist()
-                
-                # Vérifier si "icd_code" et "long_title" sont présents
-                has_icd = "icd_code" in relevant_cols
-                has_title = "long_title" in relevant_cols or "short_title" in relevant_cols
-                
-                if has_icd and has_title:
-                    title_col = "long_title" if "long_title" in relevant_cols else "short_title"
-                    
-                    # Si sequencing est disponible, trier par seq_num
-                    if "seq_num" in relevant_cols:
-                        df = df.sort_values("seq_num")
-                    
-                    # Afficher sous forme de liste interactive
-                    for _, row in df.iterrows():
-                        with st.expander(f"{row[title_col]}", expanded=False):
-                            for col in relevant_cols:
-                                if col not in ["subject_id", "hadm_id"] and pd.notna(row[col]):
-                                    st.markdown(f"**{col.replace('_', ' ').title()}**: {row[col]}")
-                else:
-                    # Affichage générique si les colonnes attendues ne sont pas présentes
-                    st.dataframe(
-                        df,
-                        use_container_width=True,
-                        hide_index=True
-                    )
-            
-            else:
-                # Pour les autres catégories, affichage générique
-                st.dataframe(
-                    df,
-                    use_container_width=True,
-                    hide_index=True
-                )
+            st.dataframe(
+                med_summary,
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            # Afficher un simple comptage si les colonnes détaillées ne sont pas disponibles
+            st.bar_chart(med_count.set_index("Medication"))
+        
+        # Historique des administrations médicamenteuses
+        st.markdown("#### Medication Administration History")
+        med_history = df.sort_values("charttime", ascending=False)
+        
+        # Sélectionner les colonnes pertinentes pour l'affichage
+        display_cols = ["charttime", "medication"]
+        for col in ["dose_given", "dose_unit", "route", "scheduletime", "event_txt"]:
+            if col in med_history.columns:
+                display_cols.append(col)
+        
+        # Renommer les colonnes pour un affichage plus clair
+        col_names = {
+            "charttime": "Given Time",
+            "medication": "Medication",
+            "dose_given": "Dose",
+            "dose_unit": "Unit",
+            "route": "Route",
+            "scheduletime": "Scheduled Time",
+            "event_txt": "Event Status"
+        }
+        
+        display_df = med_history[display_cols].rename(columns={col: col_names.get(col, col) for col in display_cols})
+        
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        # Ajouter le nouveau graphique de médicament individuel
+        st.markdown("#### Single Medication Timeline")
+        create_single_medication_timeline(df)
+    else:
+        st.info("Medication data structure is not in the expected format")
     
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1187,8 +1515,14 @@ def main():
             # charge les données détaillées du patient
             patient_data = load_patient_data(conn, tables, selected_patient, selected_admission)
             
-            # Afficher la vue intelligente des données patient
-            display_smart_patient_view(patient_data, tables)
+            # Obtenez les données de médicaments et de signes vitaux pour le dashboard
+            medication_data = get_medication_data(conn, selected_patient, selected_admission)
+            vital_signs_data = get_relevant_vital_signs(conn, selected_patient, selected_admission)
+
+            # Affichez uniquement le dashboard de médicaments
+            display_medication_dashboard(medication_data, vital_signs_data, 
+                                    st.session_state.admit_date, 
+                                    st.session_state.discharge_date)
             
             # Créer des onglets pour choisir entre l'affichage intelligent et l'affichage détaillé
             data_view_tabs = st.tabs(["Detailed Data View"])
