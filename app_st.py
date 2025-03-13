@@ -341,6 +341,187 @@ def create_medication_timeline(data, start_date=None, end_date=None):
     
     return fig
     
+def create_single_medication_chart(data, medication_name, event_types=None, start_date=None, end_date=None):
+    """
+    Create a chart showing a single medication administration over time with filtering by event type
+    and visualization as horizontal lines between scheduletime and storetime
+    """
+    if data.empty or medication_name not in data['medication'].unique():
+        return None
+    
+    # Filter data for the selected medication
+    med_data = data[data['medication'] == medication_name].copy()
+    
+    # Filter by event type if specified
+    if event_types and 'event_txt' in med_data.columns:
+        med_data = med_data[med_data['event_txt'].isin(event_types)]
+        
+    if med_data.empty:
+        return None
+    
+    # Convert datetime columns if not already
+    for col in ['charttime', 'scheduletime', 'storetime']:
+        if col in med_data.columns:
+            med_data[col] = pd.to_datetime(med_data[col], errors='coerce')
+    
+    # For records without storetime, use charttime as an approximation
+    if 'storetime' in med_data.columns and 'charttime' in med_data.columns:
+        med_data['storetime'] = med_data['storetime'].fillna(med_data['charttime'])
+    
+    # For records without scheduletime, use charttime as an approximation
+    if 'scheduletime' in med_data.columns and 'charttime' in med_data.columns:
+        med_data['scheduletime'] = med_data['scheduletime'].fillna(med_data['charttime'])
+    
+    # If we don't have both scheduletime and storetime, create a default duration
+    if 'scheduletime' not in med_data.columns or 'storetime' not in med_data.columns:
+        return None
+    
+    # Set date range for the chart
+    min_date = start_date if start_date else med_data['scheduletime'].min()
+    max_date = end_date if end_date else med_data['storetime'].max()
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Sort by scheduletime to process overlaps
+    med_data = med_data.sort_values('scheduletime')
+    
+    # Set up colors for different event types
+    event_colors = {
+        'Administered': 'rgb(0, 128, 0)',      # Green
+        'Flushed': 'rgb(0, 0, 255)',           # Blue
+        'Not Given': 'rgb(255, 0, 0)',         # Red
+        'Not Given per Sliding Scale': 'rgb(255, 165, 0)'  # Orange
+    }
+    
+    # Default color for events not in the predefined mapping
+    default_color = 'rgb(128, 128, 128)'  # Gray
+    
+    # Process each medication administration and handle overlaps
+    row_positions = {}  # Track vertical positions for each row
+    
+    for idx, row in med_data.iterrows():
+        start_time = row['scheduletime']
+        end_time = row['storetime']
+        
+        if pd.isnull(start_time) or pd.isnull(end_time):
+            continue
+            
+        # Make sure end time is after start time
+        if end_time < start_time:
+            end_time = start_time
+            
+        # Determine vertical position (row) for this administration
+        row_level = 0
+        while True:
+            overlap = False
+            if row_level in row_positions:
+                for pos_start, pos_end in row_positions[row_level]:
+                    if max(start_time, pos_start) <= min(end_time, pos_end):
+                        overlap = True
+                        break
+            if not overlap:
+                break
+            row_level += 1
+        
+        # Store position
+        if row_level not in row_positions:
+            row_positions[row_level] = []
+        row_positions[row_level].append((start_time, end_time))
+        
+        # Get event type and corresponding color
+        event_txt = row.get('event_txt', 'Unknown')
+        color = event_colors.get(event_txt, default_color)
+        
+        # Add horizontal line for the administration duration
+        fig.add_shape(
+            type="line",
+            x0=start_time,
+            y0=row_level + 1,  # Position at row level (add 1 to start from 1 instead of 0)
+            x1=end_time,
+            y1=row_level + 1,
+            line=dict(
+                color=color,
+                width=4,
+            )
+        )
+        
+        # Add marker at start for better visibility
+        fig.add_trace(go.Scatter(
+            x=[start_time],
+            y=[row_level + 1],
+            mode='markers',
+            marker=dict(
+                color=color,
+                size=8,
+                symbol='circle',
+            ),
+            showlegend=False,
+            hoverinfo='text',
+            hovertext=f"Start: {start_time.strftime('%Y-%m-%d %H:%M')}<br>Event: {event_txt}"
+        ))
+        
+        # Build hover information text
+        dose_info = f"Dose: {row['dose_given']} {row['dose_unit']}" if 'dose_given' in row and pd.notna(row['dose_given']) else ""
+        route_info = f"Route: {row['route']}" if 'route' in row and pd.notna(row['route']) else ""
+        hover_text = f"{medication_name}<br>Event: {event_txt}<br>Schedule: {start_time.strftime('%Y-%m-%d %H:%M')}<br>End: {end_time.strftime('%Y-%m-%d %H:%M')}"
+        if dose_info:
+            hover_text += f"<br>{dose_info}"
+        if route_info:
+            hover_text += f"<br>{route_info}"
+            
+        # Add invisible trace for hover information
+        fig.add_trace(go.Scatter(
+            x=[(start_time + end_time)/2],  # Middle of line
+            y=[row_level + 1],
+            mode='markers',
+            marker=dict(
+                color='rgba(0,0,0,0)',  # Invisible
+                size=1,
+            ),
+            showlegend=False,
+            hoverinfo='text',
+            hovertext=hover_text
+        ))
+    
+    # Create legend for event types
+    for event, color in event_colors.items():
+        if event in med_data.get('event_txt', []):
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None],  # No data points
+                mode='lines',
+                line=dict(color=color, width=4),
+                name=event
+            ))
+    
+    # Update layout
+    max_rows = max(row_positions.keys()) + 2 if row_positions else 2
+    
+    fig.update_layout(
+        title=f"{medication_name} Administration Timeline",
+        xaxis_title="Date/Time",
+        yaxis=dict(
+            title="Administrations",
+            range=[0, max_rows],
+            tickvals=list(range(1, max_rows)),
+            ticktext=[f"Admin {i+1}" for i in range(max_rows-1)],
+        ),
+        height=max(300, 50 + 40 * max_rows),  # Adjust height based on number of rows
+        margin=dict(l=40, r=40, t=80, b=40),
+        xaxis_range=[min_date, max_date],
+        plot_bgcolor='rgba(248,249,250,0.5)',
+        title_font=dict(size=18),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+    )
+    
+    return fig
+
 def create_combined_medication_vital_chart(med_data, vital_data, medication_name, vital_sign_name, start_date=None, end_date=None):
     """chart combining medication administration and vital sign"""
     if med_data.empty or vital_data.empty:
@@ -922,151 +1103,6 @@ def display_detailed_data(patient_data, tables):
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-def create_single_medication_timeline(med_data):
-    """Crée un graphique de prise d'un seul médicament au cours du temps avec filtres"""
-    if med_data.empty:
-        st.info("No medication data available")
-        return
-    
-    # Vérifier que les colonnes nécessaires existent
-    required_columns = ["medication", "scheduletime", "storetime", "event_txt"]
-    missing_columns = [col for col in required_columns if col not in med_data.columns]
-    
-    # Si certaines colonnes sont manquantes, utiliser des alternatives ou dégrader gracieusement
-    if "event_txt" not in med_data.columns:
-        med_data["event_txt"] = "Unknown"
-    
-    if "scheduletime" not in med_data.columns and "charttime" in med_data.columns:
-        med_data["scheduletime"] = med_data["charttime"]
-    
-    if "storetime" not in med_data.columns and "scheduletime" in med_data.columns:
-        # Si storetime est manquant, estimer à scheduletime + 1 heure par défaut
-        med_data["storetime"] = pd.to_datetime(med_data["scheduletime"]) + pd.Timedelta(hours=1)
-    
-    # Convertir les dates en datetime
-    for date_col in ["scheduletime", "storetime"]:
-        if date_col in med_data.columns:
-            med_data[date_col] = pd.to_datetime(med_data[date_col])
-    
-    # Créer les filtres
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Liste des médicaments disponibles
-        medications = sorted(med_data["medication"].unique().tolist())
-        selected_medication = st.selectbox("Select Medication:", medications, key="single_med_timeline")
-    
-    with col2:
-        # Si event_txt existe, créer un filtre pour cela aussi
-        if "event_txt" in med_data.columns:
-            event_types = sorted(med_data["event_txt"].unique().tolist())
-            selected_events = st.multiselect(
-                "Filter by Event Status:", 
-                event_types,
-                default=event_types,
-                key="single_med_event_filter"
-            )
-        else:
-            selected_events = None
-    
-    # Filtrer les données
-    filtered_data = med_data[med_data["medication"] == selected_medication]
-    
-    if selected_events:
-        filtered_data = filtered_data[filtered_data["event_txt"].isin(selected_events)]
-    
-    if filtered_data.empty:
-        st.warning("No data available for the selected filters")
-        return
-    
-    # Créer le graphique de prise de médicament
-    create_medication_administration_chart(filtered_data)
-
-def create_medication_administration_chart(med_data):
-    """Crée un graphique montrant la prise de médicament avec des lignes parallèles à l'axe des x"""
-    if med_data.empty or "scheduletime" not in med_data.columns or "storetime" not in med_data.columns:
-        st.warning("Insufficient data to create medication administration chart")
-        return
-    
-    # Trier par date de planification
-    med_data = med_data.sort_values("scheduletime")
-    
-    # Créer une figure Plotly
-    fig = go.Figure()
-    
-    # Définir une hauteur par défaut pour chaque ligne
-    line_height = 1
-    
-    # Grouper les administrations qui se chevauchent
-    scheduled_meds = []
-    
-    for i, row in med_data.iterrows():
-        # Par défaut, une nouvelle administration commence à la hauteur 0
-        current_height = 0
-        
-        # Vérifier s'il y a chevauchement avec des administrations existantes
-        for existing_med in scheduled_meds:
-            if (row["scheduletime"] <= existing_med["end_time"] and 
-                row["storetime"] >= existing_med["start_time"]):
-                # Il y a chevauchement, augmenter la hauteur
-                if current_height <= existing_med["height"]:
-                    current_height = existing_med["height"] + line_height
-        
-        # Ajouter cette administration à la liste
-        scheduled_meds.append({
-            "start_time": row["scheduletime"],
-            "end_time": row["storetime"],
-            "height": current_height,
-            "event_txt": row.get("event_txt", "Unknown"),
-            "dose": f"{row.get('dose_given', '')} {row.get('dose_unit', '')}".strip()
-        })
-    
-    # Créer un code couleur pour les différents types d'événements
-    event_types = med_data["event_txt"].unique() if "event_txt" in med_data.columns else ["Unknown"]
-    colors = px.colors.qualitative.Plotly[:len(event_types)]
-    color_map = dict(zip(event_types, colors))
-    
-    # Ajouter les lignes au graphique
-    for med in scheduled_meds:
-        event_txt = med["event_txt"]
-        color = color_map.get(event_txt, "blue")
-        
-        # Ajouter la ligne pour cette administration
-        fig.add_trace(go.Scatter(
-            x=[med["start_time"], med["end_time"]],
-            y=[med["height"], med["height"]],
-            mode="lines",
-            line=dict(color=color, width=3),
-            name=event_txt,
-            hoverinfo="text",
-            text=[f"Start: {med['start_time']}<br>Status: {event_txt}<br>Dose: {med['dose']}",
-                  f"End: {med['end_time']}<br>Status: {event_txt}<br>Dose: {med['dose']}"],
-            showlegend=True
-        ))
-    
-    # Configuration de la mise en page
-    medication_name = med_data["medication"].iloc[0]
-    
-    fig.update_layout(
-        title=f"Administration Timeline for {medication_name}",
-        xaxis_title="Time",
-        yaxis_title="Administration Instances",
-        height=500,
-        margin=dict(l=40, r=40, t=80, b=40),
-        hovermode="closest",
-        plot_bgcolor='rgba(248,249,250,0.5)',
-        yaxis=dict(
-            showticklabels=False,  # Masquer les étiquettes de l'axe y
-            showgrid=False,        # Masquer la grille de l'axe y
-        ),
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Ajouter une explication
-    st.info("This chart shows medication administration periods. Each horizontal line represents a single administration. Higher lines indicate overlapping administrations.")
 
 def display_smart_patient_view(patient_data, tables):
     """Affiche uniquement les données de médicaments de manière intelligente"""
@@ -1148,12 +1184,6 @@ def display_smart_patient_view(patient_data, tables):
             use_container_width=True,
             hide_index=True
         )
-        
-        # Ajouter le nouveau graphique de médicament individuel
-        st.markdown("#### Single Medication Timeline")
-        create_single_medication_timeline(df)
-    else:
-        st.info("Medication data structure is not in the expected format")
     
     st.markdown('</div>', unsafe_allow_html=True)
 
