@@ -126,44 +126,60 @@ def get_patient_demographics(_conn, subject_id):
         return pd.DataFrame()
 
 @st.cache_data(show_spinner=False)
-def get_medication_data(_conn, subject_id, hadm_id):
-    """get medication data with enriched information"""
-
-    try:
+def get_standardized_medications(_conn, subject_id, hadm_id, source='emar'):
+    """Récupère et standardise les données de médicaments"""
+    if source == 'emar':
         query = """
-        SELECT e.charttime, e.medication, e.scheduletime, e.dose_given, e.dose_unit, e.route
-        FROM emar e
-        WHERE e.subject_id = ? AND e.hadm_id = ?
-        ORDER BY e.charttime
+        SELECT charttime, medication, scheduletime, dose_given, dose_unit, route, event_txt
+        FROM emar
+        WHERE subject_id = ? AND hadm_id = ?
+        ORDER BY charttime
         """
-        df = pd.read_sql_query(query, _conn, params=[subject_id, hadm_id])
-        
-        if not df.empty:
-            df['charttime'] = pd.to_datetime(df['charttime'])
-            df['scheduletime'] = pd.to_datetime(df['scheduletime'])
-            return df
-    except Exception:
-        pass
+    else:
+        return pd.DataFrame()
     
     try:
-        query = """
-        SELECT p.startdate as charttime, p.drug as medication, 
-               p.enddate as scheduletime, p.dose_val_rx as dose_given,
-               p.dose_unit_rx as dose_unit, p.route
-        FROM prescriptions p
-        WHERE p.subject_id = ? AND p.hadm_id = ?
-        ORDER BY p.startdate
-        """
         df = pd.read_sql_query(query, _conn, params=[subject_id, hadm_id])
-        
         if not df.empty:
             df['charttime'] = pd.to_datetime(df['charttime'])
             df['scheduletime'] = pd.to_datetime(df['scheduletime'])
+            
+            # Standardisation des noms de médicaments (optionnel)
+            # Ex: normaliser les capitalisation, abréviations, etc.
+            df['medication'] = df['medication'].str.title()
+            
             return df
-    except Exception:
-        pass
+    except Exception as e:
+        st.error(f"Erreur lors de la récupération des médicaments: {e}")
     
     return pd.DataFrame()
+
+def create_medication_filters(medications_df, key_prefix):
+    """Crée des filtres standardisés pour les médicaments"""
+    available_meds = medications_df['medication'].unique().tolist()
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        selected_med = st.selectbox(
+            "Sélectionner un médicament:", 
+            options=available_meds,
+            key=f"{key_prefix}_med_select"
+        )
+    
+    selected_events = None
+    with col2:
+        if 'event_txt' in medications_df.columns:
+            event_options = medications_df['event_txt'].dropna().unique().tolist()
+            if event_options:
+                selected_events = st.multiselect(
+                    "Filtrer par type d'événement:",
+                    options=event_options,
+                    default=event_options,
+                    key=f"{key_prefix}_event_filter"
+                )
+    
+    return selected_med, selected_events
 
 @st.cache_data(show_spinner=False)
 def get_time_series_data(_conn, subject_id, hadm_id):
@@ -224,9 +240,9 @@ def get_time_series_data(_conn, subject_id, hadm_id):
     return time_series_data
 
 @st.cache_data(show_spinner=False)
-def get_relevant_vital_signs(_conn, subject_id, hadm_id):
-    """get the most relevant vital signs for a patient"""
-    important_vitals_query = """
+def get_standardized_vitals(_conn, subject_id, hadm_id):
+    """Récupère et standardise les données de signes vitaux"""
+    query = """
     SELECT c.charttime, d.label, c.valuenum
     FROM chartevents c
     JOIN d_items d ON c.itemid = d.itemid
@@ -242,11 +258,11 @@ def get_relevant_vital_signs(_conn, subject_id, hadm_id):
     """
     
     try:
-        df = pd.read_sql_query(important_vitals_query, _conn, params=[subject_id, hadm_id])
+        df = pd.read_sql_query(query, _conn, params=[subject_id, hadm_id])
         if not df.empty:
             df['charttime'] = pd.to_datetime(df['charttime'])
             
-            # standardize vital sign names
+            # Standardisation des noms de signes vitaux
             name_mapping = {
                 'O2 saturation pulseoxymetry': 'Oxygen Saturation',
                 'Non Invasive Blood Pressure systolic': 'Blood Pressure (Systolic)',
@@ -261,19 +277,44 @@ def get_relevant_vital_signs(_conn, subject_id, hadm_id):
             
             df['label'] = df['label'].replace(name_mapping)
             
-            # convert fahrenheit to celsius for standardization
+            # Normalisation des températures
             mask = df['label'] == 'Temperature'
             temp_f_mask = mask & df['valuenum'].between(95, 108)
-            
             if temp_f_mask.any():
                 df.loc[temp_f_mask, 'valuenum'] = (df.loc[temp_f_mask, 'valuenum'] - 32) * 5/9
             
             return df
-        return pd.DataFrame()
     except Exception as e:
-        st.error(f"Error retrieving vital signs: {e}")
-        return pd.DataFrame()
+        st.error(f"Erreur lors de la récupération des signes vitaux: {e}")
+    
+    return pd.DataFrame()
 
+def create_vitals_filters(vitals_df, key_prefix):
+    """Crée des filtres standardisés pour les signes vitaux"""
+    available_vitals = vitals_df['label'].unique().tolist()
+    
+    # Triez les signes vitaux dans un ordre cliniquement significatif
+    vital_order = {
+        'Heart Rate': 1, 
+        'Blood Pressure (Systolic)': 2, 
+        'Blood Pressure (Diastolic)': 3,
+        'MAP': 4,
+        'Respiratory Rate': 5, 
+        'Oxygen Saturation': 6,
+        'Temperature': 7,
+        'GCS': 8
+    }
+    
+    # Trie les signes vitaux disponibles selon l'ordre défini
+    available_vitals.sort(key=lambda x: vital_order.get(x, 999))
+    
+    selected_vital = st.selectbox(
+        "Sélectionner un signe vital:", 
+        options=available_vitals,
+        key=f"{key_prefix}_vital_select"
+    )
+    
+    return selected_vital
 
 def create_time_series_chart(data, title, y_label, start_date=None, end_date=None):
     """creates a time series chart with proper date range"""
@@ -654,91 +695,8 @@ def display_medication_dashboard(medication_data, vital_signs_data, admit_time, 
     if med_timeline:
         st.plotly_chart(med_timeline, use_container_width=True)
     
-    # Nouvelle section pour afficher un seul médicament à la fois avec plus de filtres
-    st.markdown("### Single Medication Administration Timeline")
-    available_meds = medication_data['medication'].unique().tolist()
-    
-    if available_meds:
-        col1, col2 = st.columns([1, 1])
-        
-        with col1:
-            selected_med = st.selectbox("Select medication to display:", 
-                                        options=available_meds,
-                                        key="single_med_select")
-        
-        # Filtrage par type d'événement si la colonne existe
-        selected_events = None
-        with col2:
-            if 'event_txt' in medication_data.columns:
-                event_options = medication_data['event_txt'].dropna().unique().tolist()
-                if event_options:
-                    selected_events = st.multiselect(
-                        "Filter by event type:",
-                        options=event_options,
-                        default=event_options,
-                        key="event_type_filter"
-                    )
-        
-        if selected_med:
-            # Date range for filtering
-            date_col1, date_col2 = st.columns([1, 1])
-            with date_col1:
-                if admit_time and discharge_time:
-                    start_date = st.date_input(
-                        "Start date:",
-                        value=admit_time.to_pydatetime(),
-                        min_value=admit_time.to_pydatetime(),
-                        max_value=discharge_time.to_pydatetime(),
-                        key="med_start_date"
-                    )
-            with date_col2:
-                if admit_time and discharge_time:
-                    end_date = st.date_input(
-                        "End date:",
-                        value=discharge_time.to_pydatetime(),
-                        min_value=admit_time.to_pydatetime(),
-                        max_value=discharge_time.to_pydatetime(),
-                        key="med_end_date"
-                    )
-            
-            # Convert date inputs to datetime
-            start_datetime = pd.to_datetime(start_date) if 'start_date' in locals() else admit_time
-            end_datetime = pd.to_datetime(end_date) if 'end_date' in locals() else discharge_time
-            
-            # Add a time selector to specify hours if needed
-            show_time_selector = st.checkbox("Specify time range", value=False, key="time_selector_checkbox")
-            if show_time_selector:
-                time_col1, time_col2 = st.columns([1, 1])
-                with time_col1:
-                    start_time = st.time_input("Start time:", value=pd.to_datetime('00:00').time(), key="start_time")
-                    start_datetime = pd.to_datetime(f"{start_date} {start_time}")
-                with time_col2:
-                    end_time = st.time_input("End time:", value=pd.to_datetime('23:59').time(), key="end_time")
-                    end_datetime = pd.to_datetime(f"{end_date} {end_time}")
-            
-            single_med_chart = create_single_medication_chart(
-                medication_data,
-                selected_med,
-                event_types=selected_events,
-                start_date=start_datetime,
-                end_date=end_datetime
-            )
-            
-            if single_med_chart:
-                st.plotly_chart(single_med_chart, use_container_width=True)
-                
-                # Ajouter des explications
-                st.info("""
-                **Graphique d'administration de médicament:**
-                - Chaque ligne horizontale représente une administration du médicament
-                - Les lignes sont empilées verticalement lorsqu'elles se chevauchent dans le temps
-                - Les couleurs indiquent le type d'événement (Administered, Not Given, etc.)
-                - Passez votre souris sur les lignes pour voir les détails
-                """)
-            else:
-                st.warning(f"No administration data available for {selected_med} with the selected filters")
-    else:
-        st.warning("No medications available for display")
+    # Suppression du bloc "Single Medication Administration Timeline"
+    # (lignes 658-741 environ dans le code original)
     
     # Afficher l'historique d'administration des médicaments
     st.markdown("### Medication Administration History")
@@ -768,6 +726,7 @@ def display_medication_dashboard(medication_data, vital_signs_data, admit_time, 
         med_history = med_history.rename(columns={col: column_mapping.get(col, col) for col in med_history.columns})
         
         # Filtrer par médicament spécifique si demandé
+        available_meds = medication_data['medication'].unique().tolist()
         med_filter = st.checkbox("Filter history by medication", value=False, key="med_history_filter")
         if med_filter:
             selected_med_history = st.selectbox(
@@ -914,6 +873,7 @@ def display_patient_summary(conn, subject_id, hadm_id):
     
     st.markdown('</div>', unsafe_allow_html=True)
 
+    
 def display_time_series_data(time_series_data, admit_time, discharge_time):
     """affiche les données de séries temporelles pour un patient"""
     if not time_series_data:
@@ -928,91 +888,143 @@ def display_time_series_data(time_series_data, admit_time, discharge_time):
     if isinstance(discharge_time, str):
         discharge_time = pd.to_datetime(discharge_time)
     
-    # date range slider for all charts
-    date_range = [admit_time, discharge_time]
+    # Date par défaut = plage complète (admission à sortie)
+    default_start_date = admit_time
+    default_end_date = discharge_time
     
-    # date range selector
+    # Initialiser une clé de session pour suivre si l'utilisateur a modifié le slider
+    if 'date_slider_changed' not in st.session_state:
+        st.session_state.date_slider_changed = False
+    
+    # date range slider for all charts
     dates = st.slider(
-        "Select Date Range for Charts",
+        "Select Date Range for Charts (or use full admission period)",
         min_value=admit_time.to_pydatetime(),
         max_value=discharge_time.to_pydatetime(),
         value=(admit_time.to_pydatetime(), discharge_time.to_pydatetime()),
-        format="DD/MM/YY HH:mm"
+        format="DD/MM/YY HH:mm",
+        key="date_range_slider"
     )
-    selected_start_date, selected_end_date = dates
     
-    # lab results
-    if 'labevents' in time_series_data and not time_series_data['labevents'].empty:
-        lab_chart = create_time_series_chart(
-            time_series_data['labevents'],
-            "Lab Results Over Time",
-            "Value",
-            selected_start_date,
-            selected_end_date
-        )
-        if lab_chart:
-            st.plotly_chart(lab_chart, use_container_width=True)
-    
-    # vital signs
-    if 'chartevents' in time_series_data and not time_series_data['chartevents'].empty:
-        vitals_chart = create_time_series_chart(
-            time_series_data['chartevents'],
-            "Vital Signs Over Time",
-            "Value",
-            selected_start_date,
-            selected_end_date
-        )
-        if vitals_chart:
-            st.plotly_chart(vitals_chart, use_container_width=True)
-    
-    # medications
-    if 'medications' in time_series_data and not time_series_data['medications'].empty:
-        med_chart = create_medication_timeline(
-            time_series_data['medications'],
-            selected_start_date,
-            selected_end_date
-        )
-        if med_chart:
-            st.plotly_chart(med_chart, use_container_width=True)
-        
-        st.markdown("### Medication and Vital Sign Correlation")
-        
-        top_meds = time_series_data['medications']['medication'].value_counts().nlargest(5).index.tolist()
-        
-        vital_data = None
-        if 'chartevents' in time_series_data and not time_series_data['chartevents'].empty:
-            vital_data = time_series_data['chartevents']
-        
-        if not top_meds or vital_data is None or vital_data.empty:
-            st.warning("Insufficient data for medication-vital sign correlation analysis.")
+    # Si l'utilisateur a modifié le slider, utiliser les dates sélectionnées
+    # Sinon, utiliser la période d'admission complète
+    if st.session_state.date_slider_changed:
+        selected_start_date, selected_end_date = dates
+    else:
+        # Vérifier si le slider est différent des valeurs par défaut
+        if dates[0] != admit_time.to_pydatetime() or dates[1] != discharge_time.to_pydatetime():
+            st.session_state.date_slider_changed = True
+            selected_start_date, selected_end_date = dates
         else:
-            # available vital signs
-            available_vitals = vital_data['label'].unique().tolist()
+            selected_start_date, selected_end_date = default_start_date, default_end_date
+    
+    # Ajouter un bouton pour réinitialiser aux dates d'admission complètes
+    if st.button("Reset to Full Admission Period", key="reset_date_range"):
+        st.session_state.date_slider_changed = False
+        # On doit rafraîchir la page pour réinitialiser le slider
+        st.experimental_rerun()
+    
+    # Ajout d'un onglet pour organiser les visualisations
+    viz_tabs = st.tabs(["Labs", "Vital Signs", "Medications", "Individual Medication", "Correlations"])
+    
+    # Onglet 1: Labos
+    with viz_tabs[0]:
+        if 'labevents' in time_series_data and not time_series_data['labevents'].empty:
+            lab_chart = create_time_series_chart(
+                time_series_data['labevents'],
+                "Résultats de laboratoire",
+                "Valeur",
+                selected_start_date,
+                selected_end_date
+            )
+            if lab_chart:
+                st.plotly_chart(lab_chart, use_container_width=True)
+    
+    # Onglet 2: Signes vitaux
+    with viz_tabs[1]:
+        if 'chartevents' in time_series_data and not time_series_data['chartevents'].empty:
+            vitals_chart = create_time_series_chart(
+                time_series_data['chartevents'],
+                "Signes vitaux",
+                "Valeur",
+                selected_start_date,
+                selected_end_date
+            )
+            if vitals_chart:
+                st.plotly_chart(vitals_chart, use_container_width=True)
+    
+    # Onglet 3: Médicaments (vue d'ensemble)
+    with viz_tabs[2]:
+        if 'medications' in time_series_data and not time_series_data['medications'].empty:
+            # Utilisez uniquement les données EMAR
+            emar_meds = time_series_data['medications']
+            med_chart = create_medication_timeline(
+                emar_meds,
+                selected_start_date,
+                selected_end_date
+            )
+            if med_chart:
+                st.plotly_chart(med_chart, use_container_width=True)
+    
+    # Onglet 4: Médicament individuel
+    with viz_tabs[3]:
+        if 'medications' in time_series_data and not time_series_data['medications'].empty:
+            emar_meds = time_series_data['medications']
+            st.markdown("### Chronology of medication administration")
             
-            if not available_vitals:
-                st.warning("No vital sign data available for correlation analysis.")
+            if not emar_meds.empty:
+                # Utilisation de la fonction standardisée pour créer des filtres cohérents
+                selected_med, selected_events = create_medication_filters(emar_meds, "ts")
+                
+                if selected_med:
+                    single_med_chart = create_single_medication_chart(
+                        emar_meds,
+                        selected_med,
+                        event_types=selected_events,
+                        start_date=selected_start_date,
+                        end_date=selected_end_date
+                    )
+                    
+                    if single_med_chart:
+                        st.plotly_chart(single_med_chart, use_container_width=True)
+                    else:
+                        st.warning(f"No data available for {selected_med} with the selected filters")
             else:
-                # selectors for medication and vital sign
-                col1, col2 = st.columns(2)
-                with col1:
-                    selected_med = st.selectbox("Select Medication:", top_meds, key="corr_med_select")
-                with col2:
-                    selected_vital = st.selectbox("Select Vital Sign:", available_vitals, key="corr_vital_select")
-                
-                combined_chart = create_combined_medication_vital_chart(
-                    time_series_data['medications'],
-                    vital_data,
-                    selected_med,
-                    selected_vital,
-                    selected_start_date,
-                    selected_end_date
-                )
-                
-                if combined_chart:
-                    st.plotly_chart(combined_chart, use_container_width=True)
-                    st.info("This chart shows the relationship between medication administration (red triangles/vertical lines) and vital sign measurements over time. Look for changes in vital signs following medication administration.")
-                else:
-                    st.warning("Not enough data to create a combined chart for the selected medication and vital sign.")
+                st.warning("No medication available")
+    
+    # Onglet 5: Corrélations médicament-vital
+    with viz_tabs[4]:
+        if ('medications' in time_series_data and not time_series_data['medications'].empty and
+            'chartevents' in time_series_data and not time_series_data['chartevents'].empty):
+            
+            emar_meds = time_series_data['medications']
+            vital_data = time_series_data['chartevents']
+            
+            st.markdown("### Drug-Vital Sign Correlation")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Réutilisation de la fonction standardisée pour les médicaments
+                selected_med, _ = create_medication_filters(emar_meds, "corr")
+            
+            with col2:
+                # Utilisation de la fonction standardisée pour les signes vitaux
+                selected_vital = create_vitals_filters(vital_data, "corr")
+            
+            combined_chart = create_combined_medication_vital_chart(
+                emar_meds,
+                vital_data,
+                selected_med,
+                selected_vital,
+                selected_start_date,
+                selected_end_date
+            )
+            
+            if combined_chart:
+                st.plotly_chart(combined_chart, use_container_width=True)
+            else:
+                st.warning("Not enough data available")
     
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1374,11 +1386,15 @@ def main():
                                     st.session_state.discharge_date)
             
             # Créer des onglets pour choisir entre l'affichage intelligent et l'affichage détaillé
-            data_view_tabs = st.tabs(["Detailed Data View"])
-            
+            data_view_tabs = st.tabs(["Detailed Data View", "Smart Patient View"])
+
             with data_view_tabs[0]:
                 # Afficher les données détaillées améliorées
                 display_detailed_data(patient_data, tables)
+                
+            with data_view_tabs[1]:
+                # Afficher la vue intelligente des données patient
+                display_smart_patient_view(patient_data, tables)
             
         elif st.session_state.patient_selected:
             st.info("👈 Please select an admission and click 'Load Data'.")
