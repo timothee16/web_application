@@ -130,7 +130,7 @@ def get_standardized_medications(_conn, subject_id, hadm_id, source='emar'):
     """Récupère et standardise les données de médicaments"""
     if source == 'emar':
         query = """
-        SELECT charttime, medication, scheduletime, dose_given, dose_unit, route, event_txt
+        SELECT charttime, medication, scheduletime, event_txt
         FROM emar
         WHERE subject_id = ? AND hadm_id = ?
         ORDER BY charttime
@@ -144,42 +144,53 @@ def get_standardized_medications(_conn, subject_id, hadm_id, source='emar'):
             df['charttime'] = pd.to_datetime(df['charttime'])
             df['scheduletime'] = pd.to_datetime(df['scheduletime'])
             
-            # Standardisation des noms de médicaments (optionnel)
-            # Ex: normaliser les capitalisation, abréviations, etc.
+            # Standardisation des noms de médicaments
             df['medication'] = df['medication'].str.title()
             
             return df
     except Exception as e:
-        st.error(f"Erreur lors de la récupération des médicaments: {e}")
+        st.error(f"Medication retrieval error: {e}")
     
     return pd.DataFrame()
 
-def create_medication_filters(medications_df, key_prefix):
-    """Crée des filtres standardisés pour les médicaments"""
-    available_meds = medications_df['medication'].unique().tolist()
+def create_medication_filters(emar_meds, prefix, create_columns=True, suffix=""):
+    """Crée des filtres pour les médicaments sans filtre par event_txt"""
     
-    col1, col2 = st.columns([1, 1])
+    # Générer une clé unique en combinant prefix et suffix
+    key_suffix = f"_{suffix}" if suffix else ""
+    key = f"{prefix}_medication_selector{key_suffix}"
     
-    with col1:
+    # Extraire les noms de médicaments uniques
+    unique_meds = emar_meds['medication'].unique()
+    
+    if create_columns:
+        try:
+            # Créer les colonnes
+            columns = st.columns([1, 1])
+            
+            # Utiliser les colonnes
+            selected_med = columns[0].selectbox(
+                "Select medication",
+                options=[""] + list(unique_meds),
+                key=key
+            )
+        except Exception as e:
+            st.error(f"Error creating columns: {e}")
+            # Fallback sans colonnes
+            selected_med = st.selectbox(
+                "Select medication",
+                options=[""] + list(unique_meds),
+                key=key
+            )
+    else:
+        # Version sans colonnes
         selected_med = st.selectbox(
-            "Sélectionner un médicament:", 
-            options=available_meds,
-            key=f"{key_prefix}_med_select"
+            "Select medication",
+            options=[""] + list(unique_meds),
+            key=key
         )
     
-    selected_events = None
-    with col2:
-        if 'event_txt' in medications_df.columns:
-            event_options = medications_df['event_txt'].dropna().unique().tolist()
-            if event_options:
-                selected_events = st.multiselect(
-                    "Filtrer par type d'événement:",
-                    options=event_options,
-                    default=event_options,
-                    key=f"{key_prefix}_event_filter"
-                )
-    
-    return selected_med, selected_events
+    return selected_med
 
 @st.cache_data(show_spinner=False)
 def get_time_series_data(_conn, subject_id, hadm_id):
@@ -285,34 +296,29 @@ def get_standardized_vitals(_conn, subject_id, hadm_id):
             
             return df
     except Exception as e:
-        st.error(f"Erreur lors de la récupération des signes vitaux: {e}")
+        st.error(f"Error during vital signs recovery: {e}")
     
     return pd.DataFrame()
 
-def create_vitals_filters(vitals_df, key_prefix):
-    """Crée des filtres standardisés pour les signes vitaux"""
-    available_vitals = vitals_df['label'].unique().tolist()
+def create_vitals_filters(vital_data, prefix, create_columns=True):
+    """Crée des filtres pour les signes vitaux"""
     
-    # Triez les signes vitaux dans un ordre cliniquement significatif
-    vital_order = {
-        'Heart Rate': 1, 
-        'Blood Pressure (Systolic)': 2, 
-        'Blood Pressure (Diastolic)': 3,
-        'MAP': 4,
-        'Respiratory Rate': 5, 
-        'Oxygen Saturation': 6,
-        'Temperature': 7,
-        'GCS': 8
-    }
+    unique_vitals = vital_data['label'].unique()
     
-    # Trie les signes vitaux disponibles selon l'ordre défini
-    available_vitals.sort(key=lambda x: vital_order.get(x, 999))
-    
-    selected_vital = st.selectbox(
-        "Sélectionner un signe vital:", 
-        options=available_vitals,
-        key=f"{key_prefix}_vital_select"
-    )
+    if create_columns:
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            selected_vital = st.selectbox(
+                "Select vital sign",
+                options=[""] + list(unique_vitals),
+                key=f"{prefix}_vital_selector"
+            )
+    else:
+        selected_vital = st.selectbox(
+            "Select vital sign",
+            options=[""] + list(unique_vitals),
+            key=f"{prefix}_vital_selector"
+        )
     
     return selected_vital
 
@@ -382,23 +388,25 @@ def create_medication_timeline(data, start_date=None, end_date=None):
     
     return fig
     
-def create_single_medication_chart(data, medication_name, event_types=None, start_date=None, end_date=None):
-    """
-    Create a chart showing a single medication administration over time with filtering by event type
-    and visualization as horizontal lines between scheduletime and storetime
-    """
-    if data.empty or medication_name not in data['medication'].unique():
+def create_single_medication_chart(emar_meds, selected_med, start_date=None, end_date=None):
+    """Crée un graphique pour un médicament spécifique"""
+    if not selected_med:
         return None
     
-    # Filter data for the selected medication
-    med_data = data[data['medication'] == medication_name].copy()
+    # Utiliser selected_med comme medication_name pour l'affichage
+    medication_name = selected_med
     
-    # Filter by event type if specified
-    if event_types and 'event_txt' in med_data.columns:
-        med_data = med_data[med_data['event_txt'].isin(event_types)]
-        
-    if med_data.empty:
+    filtered_data = emar_meds[emar_meds['medication'] == selected_med].copy()
+    
+    # Filtrage par date si spécifié
+    if start_date and end_date:
+        filtered_data = filtered_data[(filtered_data['charttime'] >= start_date) & 
+                                    (filtered_data['charttime'] <= end_date)]
+    
+    if filtered_data.empty:
         return None
+    
+    med_data = filtered_data
     
     # Convert datetime columns if not already
     for col in ['charttime', 'scheduletime', 'storetime']:
@@ -426,17 +434,6 @@ def create_single_medication_chart(data, medication_name, event_types=None, star
     
     # Sort by scheduletime to process overlaps
     med_data = med_data.sort_values('scheduletime')
-    
-    # Set up colors for different event types
-    event_colors = {
-        'Administered': 'rgb(0, 128, 0)',      # Green
-        'Flushed': 'rgb(0, 0, 255)',           # Blue
-        'Not Given': 'rgb(255, 0, 0)',         # Red
-        'Not Given per Sliding Scale': 'rgb(255, 165, 0)'  # Orange
-    }
-    
-    # Default color for events not in the predefined mapping
-    default_color = 'rgb(128, 128, 128)'  # Gray
     
     # Process each medication administration and handle overlaps
     row_positions = {}  # Track vertical positions for each row
@@ -470,9 +467,7 @@ def create_single_medication_chart(data, medication_name, event_types=None, star
             row_positions[row_level] = []
         row_positions[row_level].append((start_time, end_time))
         
-        # Get event type and corresponding color
-        event_txt = row.get('event_txt', 'Unknown')
-        color = event_colors.get(event_txt, default_color)
+        color = 'rgb(128, 128, 128)'
         
         # Add horizontal line for the administration duration
         fig.add_shape(
@@ -499,13 +494,13 @@ def create_single_medication_chart(data, medication_name, event_types=None, star
             ),
             showlegend=False,
             hoverinfo='text',
-            hovertext=f"Start: {start_time.strftime('%Y-%m-%d %H:%M')}<br>Event: {event_txt}"
+            hovertext=f"Start: {start_time.strftime('%Y-%m-%d %H:%M')}"
         ))
         
         # Build hover information text
         dose_info = f"Dose: {row['dose_given']} {row['dose_unit']}" if 'dose_given' in row and pd.notna(row['dose_given']) else ""
         route_info = f"Route: {row['route']}" if 'route' in row and pd.notna(row['route']) else ""
-        hover_text = f"{medication_name}<br>Event: {event_txt}<br>Schedule: {start_time.strftime('%Y-%m-%d %H:%M')}<br>End: {end_time.strftime('%Y-%m-%d %H:%M')}"
+        hover_text = f"{medication_name}<br>Schedule: {start_time.strftime('%Y-%m-%d %H:%M')}<br>End: {end_time.strftime('%Y-%m-%d %H:%M')}"
         if dose_info:
             hover_text += f"<br>{dose_info}"
         if route_info:
@@ -524,16 +519,6 @@ def create_single_medication_chart(data, medication_name, event_types=None, star
             hoverinfo='text',
             hovertext=hover_text
         ))
-    
-    # Create legend for event types
-    for event, color in event_colors.items():
-        if event in med_data.get('event_txt', []):
-            fig.add_trace(go.Scatter(
-                x=[None], y=[None],  # No data points
-                mode='lines',
-                line=dict(color=color, width=4),
-                name=event
-            ))
     
     # Update layout
     max_rows = max(row_positions.keys()) + 2 if row_positions else 2
@@ -663,48 +648,12 @@ def display_medication_dashboard(medication_data, vital_signs_data, admit_time, 
         return
     
     st.markdown('<div class="data-card">', unsafe_allow_html=True)
-    st.subheader("Medication Dashboard")
-    
-    st.markdown("### Medication Overview")
-    med_counts = medication_data['medication'].value_counts().reset_index()
-    med_counts.columns = ['Medication', 'Count']
-    
-    fig = px.bar(
-        med_counts.head(10),
-        x='Count',
-        y='Medication',
-        orientation='h',
-        title='Top 10 Medications by Frequency',
-        labels={'Count': 'Number of Administrations', 'Medication': ''},
-        color='Count',
-        color_continuous_scale=px.colors.sequential.Blues
-    )
-    
-    fig.update_layout(
-        height=400,
-        margin=dict(l=40, r=40, t=80, b=40),
-        yaxis={'categoryorder': 'total ascending'},
-        plot_bgcolor='rgba(248,249,250,0.5)',
-        title_font=dict(size=18)
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    st.markdown("### Medication Timeline")
-    med_timeline = create_medication_timeline(medication_data, admit_time, discharge_time)
-    if med_timeline:
-        st.plotly_chart(med_timeline, use_container_width=True)
-    
-    # Suppression du bloc "Single Medication Administration Timeline"
-    # (lignes 658-741 environ dans le code original)
-    
-    # Afficher l'historique d'administration des médicaments
-    st.markdown("### Medication Administration History")
+    st.subheader("Medication Administration History")
     
     if 'medication' in medication_data.columns and 'charttime' in medication_data.columns:
         # Colonnes à afficher
         display_cols = ['charttime', 'medication']
-        for col in ['dose_given', 'dose_unit', 'route', 'scheduletime', 'storetime', 'event_txt']:
+        for col in ['scheduletime', 'storetime', 'event_txt']:
             if col in medication_data.columns:
                 display_cols.append(col)
         
@@ -715,9 +664,6 @@ def display_medication_dashboard(medication_data, vital_signs_data, admit_time, 
         column_mapping = {
             'charttime': 'Administration Time',
             'medication': 'Medication',
-            'dose_given': 'Dose',
-            'dose_unit': 'Unit',
-            'route': 'Route',
             'scheduletime': 'Scheduled Time',
             'storetime': 'Store Time',
             'event_txt': 'Event Type'
@@ -932,8 +878,8 @@ def display_time_series_data(time_series_data, admit_time, discharge_time):
         if 'labevents' in time_series_data and not time_series_data['labevents'].empty:
             lab_chart = create_time_series_chart(
                 time_series_data['labevents'],
-                "Résultats de laboratoire",
-                "Valeur",
+                "Lab Results",
+                "Value",
                 selected_start_date,
                 selected_end_date
             )
@@ -945,18 +891,17 @@ def display_time_series_data(time_series_data, admit_time, discharge_time):
         if 'chartevents' in time_series_data and not time_series_data['chartevents'].empty:
             vitals_chart = create_time_series_chart(
                 time_series_data['chartevents'],
-                "Signes vitaux",
-                "Valeur",
+                "Vital Signs",
+                "Value",
                 selected_start_date,
                 selected_end_date
             )
             if vitals_chart:
                 st.plotly_chart(vitals_chart, use_container_width=True)
     
-    # Onglet 3: Médicaments (vue d'ensemble)
+    # Onglet 3: Médicaments
     with viz_tabs[2]:
         if 'medications' in time_series_data and not time_series_data['medications'].empty:
-            # Utilisez uniquement les données EMAR
             emar_meds = time_series_data['medications']
             med_chart = create_medication_timeline(
                 emar_meds,
@@ -974,13 +919,12 @@ def display_time_series_data(time_series_data, admit_time, discharge_time):
             
             if not emar_meds.empty:
                 # Utilisation de la fonction standardisée pour créer des filtres cohérents
-                selected_med, selected_events = create_medication_filters(emar_meds, "ts")
+                selected_med = create_medication_filters(emar_meds, "corr", create_columns=False, suffix="med_corr")
                 
                 if selected_med:
                     single_med_chart = create_single_medication_chart(
                         emar_meds,
                         selected_med,
-                        event_types=selected_events,
                         start_date=selected_start_date,
                         end_date=selected_end_date
                     )
@@ -1002,15 +946,9 @@ def display_time_series_data(time_series_data, admit_time, discharge_time):
             
             st.markdown("### Drug-Vital Sign Correlation")
             
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Réutilisation de la fonction standardisée pour les médicaments
-                selected_med, _ = create_medication_filters(emar_meds, "corr")
-            
-            with col2:
-                # Utilisation de la fonction standardisée pour les signes vitaux
-                selected_vital = create_vitals_filters(vital_data, "corr")
+            # Appel direct sans créer de colonnes supplémentaires
+            selected_med = create_medication_filters(emar_meds, "corr", create_columns=False, suffix="vital_corr")
+            selected_vital = create_vitals_filters(vital_data, "corr", create_columns=False)
             
             combined_chart = create_combined_medication_vital_chart(
                 emar_meds,
@@ -1377,8 +1315,8 @@ def main():
             patient_data = load_patient_data(conn, tables, selected_patient, selected_admission)
             
             # Obtenez les données de médicaments et de signes vitaux pour le dashboard
-            medication_data = get_medication_data(conn, selected_patient, selected_admission)
-            vital_signs_data = get_relevant_vital_signs(conn, selected_patient, selected_admission)
+            medication_data = get_standardized_medications(conn, selected_patient, selected_admission)
+            vital_signs_data = get_standardized_vitals(conn, selected_patient, selected_admission)
 
             # Affichez uniquement le dashboard de médicaments
             display_medication_dashboard(medication_data, vital_signs_data, 
