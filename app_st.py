@@ -131,7 +131,7 @@ def get_standardized_medications(_conn, subject_id, hadm_id, source='emar'):
     """Récupère et standardise les données de médicaments"""
     if source == 'emar':
         query = """
-        SELECT charttime, medication, scheduletime, event_txt
+        SELECT charttime, medication, scheduletime, storetime, event_txt
         FROM emar
         WHERE subject_id = ? AND hadm_id = ?  /* Ordre optimal pour utiliser l'index */
         ORDER BY charttime
@@ -198,13 +198,13 @@ def get_time_series_data(_conn, subject_id, hadm_id):
     """get time series data for a patient and admission"""
     time_series_data = {}
     
-    # labevents - optimisé pour utiliser l'index
+    # labevents
     try:
         query = """
         SELECT l.charttime, d.label, l.valuenum
         FROM labevents l
         JOIN d_labitems d ON l.itemid = d.itemid
-        WHERE l.subject_id = ? AND l.hadm_id = ?  /* Ordre optimal pour utiliser l'index */
+        WHERE l.subject_id = ? AND l.hadm_id = ?
         AND l.valuenum IS NOT NULL
         ORDER BY l.charttime
         """
@@ -215,13 +215,13 @@ def get_time_series_data(_conn, subject_id, hadm_id):
     except Exception as e:
         st.error(f"Error retrieving lab data: {e}")
     
-    # vital signs - optimisé
+    # vital signs
     try:
         query = """
         SELECT c.charttime, d.label, c.valuenum
         FROM chartevents c
         JOIN d_items d ON c.itemid = d.itemid
-        WHERE c.subject_id = ? AND c.hadm_id = ?  /* Ordre optimal pour utiliser l'index */
+        WHERE c.subject_id = ? AND c.hadm_id = ?
         AND c.valuenum IS NOT NULL
         AND d.category IN ('Vitals', 'Labs', 'Routine Vital Signs')
         ORDER BY c.charttime
@@ -233,12 +233,12 @@ def get_time_series_data(_conn, subject_id, hadm_id):
     except Exception:
         pass
 
-    # medications (emar) - optimisé
+    # medications (emar)
     try:
         query = """
-        SELECT charttime, medication, scheduletime
+        SELECT charttime, medication, scheduletime, storetime, event_txt
         FROM emar
-        WHERE subject_id = ? AND hadm_id = ?  /* Ordre optimal pour utiliser l'index */
+        WHERE subject_id = ? AND hadm_id = ?
         ORDER BY charttime
         """
         df = pd.read_sql_query(query, _conn, params=[subject_id, hadm_id])
@@ -258,7 +258,7 @@ def get_standardized_vitals(_conn, subject_id, hadm_id):
     SELECT c.charttime, d.label, c.valuenum
     FROM chartevents c
     JOIN d_items d ON c.itemid = d.itemid
-    WHERE c.subject_id = ? AND c.hadm_id = ?  /* Ordre optimal pour utiliser l'index */
+    WHERE c.subject_id = ? AND c.hadm_id = ?
     AND c.valuenum IS NOT NULL
     AND d.label IN (
         'Heart Rate', 'Respiratory Rate', 'O2 saturation pulseoxymetry',
@@ -271,8 +271,6 @@ def get_standardized_vitals(_conn, subject_id, hadm_id):
     
     try:
         df = pd.read_sql_query(query, _conn, params=[subject_id, hadm_id])
-        # Le reste de la fonction reste inchangé
-        # ...
     except Exception as e:
         st.error(f"Error during vital signs recovery: {e}")
     
@@ -366,6 +364,14 @@ def create_medication_timeline(data, start_date=None, end_date=None):
     
     return fig
     
+# Dans la fonction create_single_medication_chart, remplacez les lignes problématiques 
+# où vous essayez d'additionner des objets Timestamp
+
+# Version incorrecte:
+# filtered_data['storetime'] = filtered_data['storetime'].fillna(
+#     filtered_data['scheduletime'] + pd.Timedelta(hours=1))
+
+# Version corrigée:
 def create_single_medication_chart(emar_meds, selected_med, start_date=None, end_date=None):
     """Crée un graphique pour un médicament spécifique"""
     if not selected_med:
@@ -374,34 +380,84 @@ def create_single_medication_chart(emar_meds, selected_med, start_date=None, end
     # Utiliser selected_med comme medication_name pour l'affichage
     medication_name = selected_med
     
+    # Filtrer les données pour le médicament sélectionné
     filtered_data = emar_meds[emar_meds['medication'] == selected_med].copy()
+    
+    # Si aucune donnée après filtrage par médicament, retourner None
+    if filtered_data.empty:
+        return None
+    
+    # Convertir les colonnes de dates en datetime avant le filtrage
+    datetime_columns = ['charttime', 'scheduletime', 'storetime']
+    for col in datetime_columns:
+        if col in filtered_data.columns:
+            filtered_data[col] = pd.to_datetime(filtered_data[col], errors='coerce')
     
     # Filtrage par date si spécifié
     if start_date and end_date:
-        filtered_data = filtered_data[(filtered_data['charttime'] >= start_date) & 
-                                    (filtered_data['charttime'] <= end_date)]
+        # Convertir start_date et end_date en Timestamp si ce ne sont pas des objets datetime
+        if not isinstance(start_date, pd.Timestamp):
+            start_date = pd.to_datetime(start_date)
+        if not isinstance(end_date, pd.Timestamp):
+            end_date = pd.to_datetime(end_date)
+        
+        # Utiliser scheduletime pour le filtrage
+        if 'scheduletime' in filtered_data.columns:
+            date_filtered = filtered_data[
+                (filtered_data['scheduletime'] >= start_date) & 
+                (filtered_data['scheduletime'] <= end_date)
+            ].copy()
+            
+            # Si le filtrage par scheduletime ne retourne rien, essayer avec charttime
+            if date_filtered.empty and 'charttime' in filtered_data.columns:
+                date_filtered = filtered_data[
+                    (filtered_data['charttime'] >= start_date) & 
+                    (filtered_data['charttime'] <= end_date)
+                ].copy()
+            
+            filtered_data = date_filtered
     
+    # Si aucune donnée après filtrage par date, retourner None
+    if filtered_data.empty:
+        return None
+    
+    # Remplir les valeurs manquantes dans scheduletime et storetime
+    if 'scheduletime' not in filtered_data.columns and 'charttime' in filtered_data.columns:
+        filtered_data['scheduletime'] = filtered_data['charttime']
+    
+    if 'storetime' not in filtered_data.columns:
+        if 'charttime' in filtered_data.columns:
+            # Ajouter une heure à charttime
+            filtered_data['storetime'] = filtered_data['charttime'].apply(
+                lambda x: x + pd.Timedelta(hours=1) if pd.notnull(x) else None
+            )
+        elif 'scheduletime' in filtered_data.columns:
+            # Ajouter une heure à scheduletime
+            filtered_data['storetime'] = filtered_data['scheduletime'].apply(
+                lambda x: x + pd.Timedelta(hours=1) if pd.notnull(x) else None
+            )
+    
+    # Remplir les NaN
+    if 'scheduletime' in filtered_data.columns and 'charttime' in filtered_data.columns:
+        # Remplacer les NaN dans scheduletime par charttime
+        filtered_data.loc[filtered_data['scheduletime'].isna(), 'scheduletime'] = \
+            filtered_data.loc[filtered_data['scheduletime'].isna(), 'charttime']
+    
+    if 'storetime' in filtered_data.columns and 'scheduletime' in filtered_data.columns:
+        # Remplacer les NaN dans storetime
+        mask = filtered_data['storetime'].isna()
+        filtered_data.loc[mask, 'storetime'] = filtered_data.loc[mask, 'scheduletime'].apply(
+            lambda x: x + pd.Timedelta(hours=1) if pd.notnull(x) else None
+        )
+    
+    # Éliminer les lignes avec des NaN dans scheduletime ou storetime
+    filtered_data = filtered_data.dropna(subset=['scheduletime', 'storetime'])
+    
+    # Vérifier encore une fois si des données restent
     if filtered_data.empty:
         return None
     
     med_data = filtered_data
-    
-    # Convert datetime columns if not already
-    for col in ['charttime', 'scheduletime', 'storetime']:
-        if col in med_data.columns:
-            med_data[col] = pd.to_datetime(med_data[col], errors='coerce')
-    
-    # For records without storetime, use charttime as an approximation
-    if 'storetime' in med_data.columns and 'charttime' in med_data.columns:
-        med_data['storetime'] = med_data['storetime'].fillna(med_data['charttime'])
-    
-    # For records without scheduletime, use charttime as an approximation
-    if 'scheduletime' in med_data.columns and 'charttime' in med_data.columns:
-        med_data['scheduletime'] = med_data['scheduletime'].fillna(med_data['charttime'])
-    
-    # If we don't have both scheduletime and storetime, create a default duration
-    if 'scheduletime' not in med_data.columns or 'storetime' not in med_data.columns:
-        return None
     
     # Set date range for the chart
     min_date = start_date if start_date else med_data['scheduletime'].min()
@@ -424,8 +480,9 @@ def create_single_medication_chart(emar_meds, selected_med, start_date=None, end
             continue
             
         # Make sure end time is after start time
-        if end_time < start_time:
-            end_time = start_time
+        if end_time <= start_time:
+            # Ajouter une heure pour avoir une durée valide
+            end_time = start_time + pd.Timedelta(hours=1)
             
         # Determine vertical position (row) for this administration
         row_level = 0
@@ -445,13 +502,19 @@ def create_single_medication_chart(emar_meds, selected_med, start_date=None, end
             row_positions[row_level] = []
         row_positions[row_level].append((start_time, end_time))
         
-        color = 'rgb(128, 128, 128)'
+        # Définir la couleur en fonction de event_txt
+        color = 'rgb(128, 128, 128)'  # Gris par défaut
+        if 'event_txt' in row and pd.notna(row['event_txt']):
+            if row['event_txt'].lower() in ['not given', 'canceled', 'cancelled']:
+                color = 'rgb(255, 0, 0)'  # Rouge
+            elif row['event_txt'].lower() in ['given', 'administered', 'flushed']:
+                color = 'rgb(0, 128, 0)'  # Vert
         
         # Add horizontal line for the administration duration
         fig.add_shape(
             type="line",
             x0=start_time,
-            y0=row_level + 1,  # Position at row level (add 1 to start from 1 instead of 0)
+            y0=row_level + 1,
             x1=end_time,
             y1=row_level + 1,
             line=dict(
@@ -478,7 +541,11 @@ def create_single_medication_chart(emar_meds, selected_med, start_date=None, end
         # Build hover information text
         dose_info = f"Dose: {row['dose_given']} {row['dose_unit']}" if 'dose_given' in row and pd.notna(row['dose_given']) else ""
         route_info = f"Route: {row['route']}" if 'route' in row and pd.notna(row['route']) else ""
+        event_info = f"Status: {row['event_txt']}" if 'event_txt' in row and pd.notna(row['event_txt']) else ""
+        
         hover_text = f"{medication_name}<br>Schedule: {start_time.strftime('%Y-%m-%d %H:%M')}<br>End: {end_time.strftime('%Y-%m-%d %H:%M')}"
+        if event_info:
+            hover_text += f"<br>{event_info}"
         if dose_info:
             hover_text += f"<br>{dose_info}"
         if route_info:
@@ -486,7 +553,7 @@ def create_single_medication_chart(emar_meds, selected_med, start_date=None, end
             
         # Add invisible trace for hover information
         fig.add_trace(go.Scatter(
-            x=[(start_time + end_time)/2],  # Middle of line
+            x=[(start_time + (end_time - start_time)/2)],  # Middle of line - fixed calculation
             y=[row_level + 1],
             mode='markers',
             marker=dict(
@@ -899,7 +966,8 @@ def display_time_series_data(time_series_data, admit_time, discharge_time):
                 # Utilisation de la fonction standardisée pour créer des filtres cohérents
                 selected_med = create_medication_filters(emar_meds, "corr", create_columns=False, suffix="med_corr")
                 
-                if selected_med:
+                if selected_med:                    
+                    # Créer le graphique avec gestion améliorée des erreurs
                     single_med_chart = create_single_medication_chart(
                         emar_meds,
                         selected_med,
